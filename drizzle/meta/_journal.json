@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1788038952507,
+      "tag": "0000_grocery_lists",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1788043000000,
+      "tag": "0001_user_recipe_books",
+      "breakpoints": true
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "4fa8c68a-e24e-45f4-8f32-4610aa2cb7f1",
+  "prevId": "d5810a61-d51f-4c18-93d1-89f16d248e6a",
+  "tables": {
+    "grocery_lists": {
+      "name": "grocery_lists",
+      "columns": {
+        "user_id": { "name": "user_id", "type": "text", "primaryKey": true, "notNull": true, "autoincrement": false },
+        "items_json": { "name": "items_json", "type": "text", "primaryKey": false, "notNull": true, "autoincrement": false },
+        "updated_at": { "name": "updated_at", "type": "integer", "primaryKey": false, "notNull": true, "autoincrement": false }
+      },
+      "indexes": {}, "foreignKeys": {}, "compositePrimaryKeys": {}, "uniqueConstraints": {}, "checkConstraints": {}
+    },
+    "recipe_books": {
+      "name": "recipe_books",
+      "columns": {
+        "user_id": { "name": "user_id", "type": "text", "primaryKey": true, "notNull": true, "autoincrement": false },
+        "recipes_json": { "name": "recipes_json", "type": "text", "primaryKey": false, "notNull": true, "autoincrement": false },
+        "updated_at": { "name": "updated_at", "type": "integer", "primaryKey": false, "notNull": true, "autoincrement": false }
+      },
+      "indexes": {}, "foreignKeys": {}, "compositePrimaryKeys": {}, "uniqueConstraints": {}, "checkConstraints": {}
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": { "schemas": {}, "tables": {}, "columns": {} },
+  "internal": { "indexes": {} }
+}
