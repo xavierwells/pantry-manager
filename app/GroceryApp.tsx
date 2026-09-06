@@ -18,6 +18,9 @@ type InstallPromptEvent = Event & {
 };
 type BarcodeDetectorLike = { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> };
 type ScanEntry = { code: string; name: string; detail: string; kind: 'added' | 'updated' | 'missing' | 'error' };
+type BarcodeProduct = { code: string; name: string; brand?: string; qty?: string; category?: string; source?: string };
+type BarcodeMatch = { item: GroceryItem; score: number; sharedWords: string[] };
+type PendingBarcodeMatch = { product: BarcodeProduct; matches: BarcodeMatch[] };
 
 declare global {
   interface Window {
@@ -78,6 +81,49 @@ function namesMatch(left: string, right: string) {
   return a === b || a.includes(b) || b.includes(a);
 }
 
+const BARCODE_MATCH_STOP_WORDS = new Set([
+  'and', 'the', 'with', 'flavor', 'flavored', 'drink', 'beverage', 'can', 'bottle',
+  'pack', 'count', 'ct', 'fl', 'fluid', 'ounce', 'ounces', 'oz', 'ml', 'liter', 'litre',
+]);
+
+function barcodeMatchText(value: string) {
+  return normalize(value)
+    .replace(/\blow carb\b/g, 'lo carb')
+    .replace(/\bsugar free\b/g, 'zero sugar');
+}
+
+function barcodeMatchWords(value: string) {
+  return [...new Set(barcodeMatchText(value).split(' ').filter((word) => (
+    word.length > 1 && !/^\d+$/.test(word) && !BARCODE_MATCH_STOP_WORDS.has(word)
+  )))];
+}
+
+function scoreBarcodeMatch(itemName: string, productName: string, brand = '') {
+  const itemText = barcodeMatchText(itemName);
+  const productText = barcodeMatchText(`${brand} ${productName}`);
+  if (itemText === productText) return { score: 1, sharedWords: barcodeMatchWords(itemText) };
+  if (itemText.length >= 5 && (productText.includes(itemText) || itemText.includes(productText))) {
+    return { score: 0.96, sharedWords: barcodeMatchWords(itemText).filter((word) => productText.includes(word)) };
+  }
+
+  const itemWords = barcodeMatchWords(itemText);
+  const productWords = new Set(barcodeMatchWords(productText));
+  const sharedWords = itemWords.filter((word) => productWords.has(word));
+  if (!sharedWords.length || !itemWords.length || !productWords.size) return { score: 0, sharedWords };
+  const itemCoverage = sharedWords.length / itemWords.length;
+  const productCoverage = sharedWords.length / productWords.size;
+  const multipleWordBonus = sharedWords.length > 1 ? 0.08 : 0;
+  return { score: Math.min(0.95, itemCoverage * 0.72 + productCoverage * 0.28 + multipleWordBonus), sharedWords };
+}
+
+function findBarcodeMatches(items: GroceryItem[], product: BarcodeProduct) {
+  return items
+    .map((item) => ({ item, ...scoreBarcodeMatch(item.name, product.name, product.brand) }))
+    .filter((match) => match.score >= 0.48)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 5);
+}
+
 function mergeRecipePantry(items: GroceryItem[]) {
   const next = items.map((item) => ({ ...item }));
   for (const pantryItem of recipePantryItems) {
@@ -127,6 +173,7 @@ export default function GroceryApp() {
   const [scannerStatus, setScannerStatus] = useState('Starting camera…');
   const [scanEntries, setScanEntries] = useState<ScanEntry[]>([]);
   const [pendingBarcode, setPendingBarcode] = useState('');
+  const [pendingBarcodeMatch, setPendingBarcodeMatch] = useState<PendingBarcodeMatch | null>(null);
   const [toast, setToast] = useState('');
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const itemsRef = useRef(items);
@@ -138,11 +185,13 @@ export default function GroceryApp() {
   const scannerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const processedBarcodes = useRef(new Set<string>());
   const pendingBarcodeRef = useRef('');
+  const pendingBarcodeMatchRef = useRef<PendingBarcodeMatch | null>(null);
   const lastBarcodeLookup = useRef(0);
   const allRecipes = useMemo(() => [...recipes, ...userRecipes], [userRecipes]);
 
   useEffect(() => { itemsRef.current = items; }, [items]);
   useEffect(() => { pendingBarcodeRef.current = pendingBarcode; }, [pendingBarcode]);
+  useEffect(() => { pendingBarcodeMatchRef.current = pendingBarcodeMatch; }, [pendingBarcodeMatch]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -209,6 +258,38 @@ export default function GroceryApp() {
     }
   }, []);
 
+  const acceptBarcodeProduct = useCallback((product: BarcodeProduct, existingId?: string) => {
+    const current = itemsRef.current.map((item) => ({ ...item }));
+    const existing = existingId ? current.find((item) => item.id === existingId) : undefined;
+    const productSource = [product.brand, product.source].filter(Boolean).join(' · ') || 'Barcode scan';
+    if (existing) {
+      existing.inInventory = true;
+      existing.checked = false;
+      if (!existing.source.includes('Barcode')) existing.source = `${existing.source}; Barcode scan`;
+    } else {
+      current.push({
+        id: makeId(),
+        name: product.name,
+        qty: product.qty || '1 item',
+        category: product.category || 'Pantry & meal builders',
+        checked: false,
+        inInventory: true,
+        source: productSource,
+        shopTier: inferShopTier({ name: product.name, category: product.category || 'Pantry & meal builders', source: productSource }),
+      });
+    }
+    persist(current);
+    setPendingBarcodeMatch(null);
+    setScanEntries((entries) => [{
+      code: product.code,
+      name: existing?.name ?? product.name,
+      detail: existing ? `Matched “${product.name}” · Marked on hand` : `${product.qty || '1 item'} · Added to inventory`,
+      kind: existing ? 'updated' : 'added',
+    }, ...entries]);
+    if ('vibrate' in navigator) navigator.vibrate(70);
+    setScannerStatus('Added. Show the next barcode.');
+  }, [persist]);
+
   const lookupBarcode = useCallback(async (rawCode: string) => {
     const code = rawCode.replace(/\D/g, '');
     if (!/^\d{8,14}$/.test(code)) {
@@ -234,36 +315,23 @@ export default function GroceryApp() {
         setScannerStatus('Product not found. Scanning is paused.');
         return;
       }
-      const current = itemsRef.current.map((item) => ({ ...item }));
-      const existing = current.find((item) => namesMatch(item.name, result.name!));
-      const source = [result.brand, result.source].filter(Boolean).join(' · ') || 'Barcode scan';
-      if (existing) {
-        existing.inInventory = true;
-        existing.checked = false;
-        if (!existing.source.includes('Barcode')) existing.source = `${existing.source}; Barcode scan`;
+      const product: BarcodeProduct = { code, name: result.name, brand: result.brand, qty: result.qty, category: result.category, source: result.source };
+      const matches = findBarcodeMatches(itemsRef.current, product);
+      if (matches.length === 1 && matches[0].score >= 0.72) {
+        acceptBarcodeProduct(product, matches[0].item.id);
+      } else if (matches.length) {
+        setPendingBarcodeMatch({ product, matches });
+        setScannerStatus(matches.length > 1 ? 'Choose the matching inventory item.' : 'Confirm the possible match.');
       } else {
-        current.push({
-          id: makeId(),
-          name: result.name,
-          qty: result.qty || '1 item',
-          category: result.category || 'Pantry & meal builders',
-          checked: false,
-          inInventory: true,
-          source,
-          shopTier: inferShopTier({ name: result.name, category: result.category || 'Pantry & meal builders', source }),
-        });
+        acceptBarcodeProduct(product);
       }
-      persist(current);
-      setScanEntries((entries) => [{ code, name: result.name!, detail: existing ? 'Marked on hand' : `${result.qty || '1 item'} · Added to inventory`, kind: existing ? 'updated' : 'added' }, ...entries]);
-      if ('vibrate' in navigator) navigator.vibrate(70);
-      setScannerStatus('Added. Show the next barcode.');
     } catch (error) {
       processedBarcodes.current.delete(code);
       const message = error instanceof Error ? error.message : 'Lookup failed';
       setScanEntries((entries) => [{ code, name: 'Lookup failed', detail: message, kind: 'error' }, ...entries]);
       setScannerStatus('Lookup failed. You can enter the barcode again.');
     }
-  }, [persist]);
+  }, [acceptBarcodeProduct]);
 
   const pullFromCloud = useCallback(async (preferRemote = false) => {
     try {
@@ -457,7 +525,7 @@ export default function GroceryApp() {
         setScannerStatus('Ready. Hold a barcode inside the frame.');
         const detectNext = async () => {
           if (stopped) return;
-          if (!detecting && !pendingBarcodeRef.current && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          if (!detecting && !pendingBarcodeRef.current && !pendingBarcodeMatchRef.current && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
             detecting = true;
             try {
               const codes = await detector.detect(video);
@@ -595,6 +663,7 @@ export default function GroceryApp() {
     lastBarcodeLookup.current = 0;
     setScanEntries([]);
     setPendingBarcode('');
+    setPendingBarcodeMatch(null);
     setScannerStatus('Starting camera…');
     setScannerOpen(true);
     setView('inventory');
@@ -651,6 +720,11 @@ export default function GroceryApp() {
 
   function skipUnknownBarcode() {
     setPendingBarcode('');
+    setScannerStatus('Skipped. Show the next barcode.');
+  }
+
+  function skipBarcodeMatch() {
+    setPendingBarcodeMatch(null);
     setScannerStatus('Skipped. Show the next barcode.');
   }
 
@@ -952,6 +1026,16 @@ export default function GroceryApp() {
                 <label htmlFor="unknown-category">Category</label><select id="unknown-category" name="category">{inventoryCategories.map((category) => <option key={category}>{category}</option>)}</select>
                 <div><button className="button secondary" type="button" onClick={skipUnknownBarcode}>Skip</button><button className="button primary" type="submit">Add to inventory</button></div>
               </form>}
+              {pendingBarcodeMatch && <section className="match-approval" role="alertdialog" aria-labelledby="match-approval-title">
+                <p className="match-kicker">Possible inventory match</p>
+                <h3 id="match-approval-title">Where should “{pendingBarcodeMatch.product.name}” go?</h3>
+                {pendingBarcodeMatch.product.brand && <p className="match-brand">{pendingBarcodeMatch.product.brand}</p>}
+                <div className="match-options">{pendingBarcodeMatch.matches.map((match) => <button type="button" key={match.item.id} onClick={() => acceptBarcodeProduct(pendingBarcodeMatch.product, match.item.id)}>
+                  <strong>{match.item.name}</strong><small>{match.item.qty} · {match.item.category}</small>
+                </button>)}</div>
+                <button className="button secondary match-new" type="button" onClick={() => acceptBarcodeProduct(pendingBarcodeMatch.product)}>Add as a new item</button>
+                <button className="match-skip" type="button" onClick={skipBarcodeMatch}>Skip this barcode</button>
+              </section>}
               <div className="scan-log"><div className="scan-log-head"><h3>Scanned this session</h3><span>{scanEntries.filter((entry) => entry.kind === 'added' || entry.kind === 'updated').length}</span></div>{scanEntries.length ? scanEntries.map((entry, index) => <div className={`scan-entry is-${entry.kind}`} key={`${entry.code}-${index}`}><i /><div><strong>{entry.name}</strong><small>{entry.detail}</small><code>{entry.code}</code></div></div>) : <p className="scan-empty">No items scanned yet.</p>}</div>
               <p className="scanner-source">Product recognition: <a href="https://world.openfoodfacts.org" target="_blank" rel="noreferrer">Open Food Facts</a>. Scanned items are marked on hand automatically.</p>
             </aside>
@@ -966,6 +1050,20 @@ export default function GroceryApp() {
           <div className="dialog-body"><div><h3>Ingredients</h3><ul>{selectedRecipe.ingredients.map((ingredient) => <li key={ingredient}>{ingredient}</li>)}</ul><button className="button primary" onClick={() => addRecipeIngredients(selectedRecipe)}>Add ingredients to grocery list</button>{selectedRecipe.userCreated && <button className="button danger recipe-delete" onClick={() => void deleteUserRecipe(selectedRecipe)}>Delete recipe</button>}{selectedRecipe.note && <p className="recipe-note">{selectedRecipe.note}</p>}</div><div><h3>Method</h3><ol>{selectedRecipe.steps.map((step) => <li key={step}>{step}</li>)}</ol></div></div>
         </section>
       </div>}
+      <style jsx>{`
+        .match-approval { margin-top: 15px; padding: 16px; border: 1px solid #b8cdbd; border-radius: 14px; background: #f2f8f3; }
+        .match-kicker { margin: 0 0 6px; color: var(--green); font-size: 9px; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+        .match-approval h3 { margin: 0; font-size: 15px; line-height: 1.35; }
+        .match-brand { margin: 5px 0 0; color: var(--muted); font-size: 10px; }
+        .match-options { display: grid; gap: 7px; margin-top: 13px; }
+        .match-options button { width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 10px 11px; background: #fff; color: var(--ink); text-align: left; cursor: pointer; }
+        .match-options button:hover, .match-options button:focus-visible { border-color: var(--green); box-shadow: 0 0 0 3px rgba(29,106,69,.1); }
+        .match-options strong, .match-options small { display: block; }
+        .match-options strong { font-size: 12px; }
+        .match-options small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+        .match-new { width: 100%; margin-top: 10px; }
+        .match-skip { width: 100%; margin-top: 7px; border: 0; background: transparent; color: var(--muted); font-size: 10px; text-decoration: underline; cursor: pointer; }
+      `}</style>
       <div className={`toast ${toast ? 'is-visible' : ''}`} role="status">{toast}</div>
     </main>
   );
